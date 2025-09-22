@@ -9,7 +9,7 @@ def _severity_from_score(score: float) -> str:
 
 def assess_dfd(
     dfd: Dict[str, Any],
-    stride: Optional[List[str]] = None   # <- 这里改了
+    stride: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     findings: List[Dict[str, Any]] = []
 
@@ -39,7 +39,7 @@ def assess_dfd(
                 "severity": _severity_from_score(score),
             })
 
-    # 排个序并加 rank
+    # sort and add rank
     findings.sort(key=lambda x: {"High":0, "Medium":1, "Low":2}[x["severity"]])
     for i, f in enumerate(findings, start=1):
         f["rank"] = i
@@ -58,7 +58,7 @@ def assess_dfd(
         "summary": summary,
     }
 
-# 兼容 app 的自动探测：提供多个入口别名
+# Automatic detection compatible with apps: Provide multiple entry aliases
 def assess(dfd, stride=None):   return assess_dfd(dfd, stride)
 def evaluate(dfd, stride=None): return assess_dfd(dfd, stride)
 def analyze(dfd, stride=None):  return assess_dfd(dfd, stride)

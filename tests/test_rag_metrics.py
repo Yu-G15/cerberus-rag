@@ -118,7 +118,6 @@ if os.path.exists(ASSESS_FILE):
     try:
         cases = _load_cases(ASSESS_FILE)
     except Exception as e:
-        # 让错误更可读
         raise SystemExit(f"Failed to load assess file '{ASSESS_FILE}': {e}")
 else:
     cases = []

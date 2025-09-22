@@ -10,7 +10,6 @@ ARTIFACTS = os.path.join(ROOT, "artifacts")
 MODEL_NAME = None  # will be loaded from config
 
 def init():
-    # 如果你有向量索引加载逻辑，可以放这里
     print("Retriever init: nothing to load (dummy mode).")
 
 def search(query: str, top_k: int = 5):

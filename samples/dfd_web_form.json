@@ -1,0 +1,13 @@
+{
+  "version": "1.0",
+  "nodes": [
+    {"id":"E1","type":"external_entity","name":"User","trust_zone":"internet"},
+    {"id":"P1","type":"process","name":"Auth Service","trust_zone":"app"},
+    {"id":"D1","type":"data_store","name":"User DB","trust_zone":"app"}
+  ],
+  "trust_boundaries":[{"id":"TB1","from_zone":"internet","to_zone":"app","name":"Internet->App"}],
+  "flows": [
+    {"id":"F1","source":"E1","target":"P1","data":{"protocol":"HTTP","classification":"PII"}},
+    {"id":"F2","source":"P1","target":"D1","data":{"protocol":"SQL","classification":"PII"}}
+  ]
+}

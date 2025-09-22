@@ -1,0 +1,13 @@
+{
+  "version":"1.0",
+  "nodes":[
+    {"id":"M1","type":"external_entity","name":"Mobile App","trust_zone":"internet"},
+    {"id":"P1","type":"process","name":"Auth API","trust_zone":"app"},
+    {"id":"P2","type":"process","name":"Resource API","trust_zone":"app"}
+  ],
+  "trust_boundaries":[{"id":"TB1","from_zone":"internet","to_zone":"app","name":"Internet->App"}],
+  "flows":[
+    {"id":"F1","source":"M1","target":"P1","data":{"protocol":"HTTPS","classification":"PII"}},
+    {"id":"F2","source":"P1","target":"P2","data":{"protocol":"HTTPS","classification":"Token"}}
+  ]
+}

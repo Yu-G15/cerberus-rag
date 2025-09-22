@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+.DS_Store
+.vscode/
+.idea/
+*.log
+
+# 大文件不要进仓库
+data/
+datasets/
+models/
+checkpoints/
+*.bin
+*.pt
+*.ckpt
+*.ipynb_checkpoints/
+node_modules/

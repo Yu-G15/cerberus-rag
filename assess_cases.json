@@ -1,0 +1,14 @@
+[
+  {
+    "query": "What is spoofing in STRIDE?",
+    "relevant_ids": ["spoofing", "stride_overview"]
+  },
+  {
+    "query": "List common OWASP threats related to tampering",
+    "relevant_ids": ["tampering", "owasp_top10"]
+  },
+  {
+    "query": "What data does the User DB store?",
+    "relevant_ids": ["User DB"]
+  }
+]

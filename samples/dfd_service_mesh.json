@@ -1,0 +1,13 @@
+{
+  "version":"1.0",
+  "nodes":[
+    {"id":"P1","type":"process","name":"Order API","trust_zone":"app"},
+    {"id":"P2","type":"process","name":"Payment Svc","trust_zone":"app"},
+    {"id":"D1","type":"data_store","name":"TXN DB","trust_zone":"app"}
+  ],
+  "trust_boundaries":[],
+  "flows":[
+    {"id":"F1","source":"P1","target":"P2","data":{"protocol":"HTTPS","classification":"Internal"}},
+    {"id":"F2","source":"P2","target":"D1","data":{"protocol":"SQL","classification":"Financial"}}
+  ]
+}

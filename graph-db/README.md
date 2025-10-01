@@ -117,7 +117,7 @@ CREATE (tb:TrustBoundaryNode {
   description: row.description
 });
 
-LOAD CSV WITH HEADERS FROM 'file:///protects.csv' AS row
+LOAD CSV WITH HEADERS FROM 'file:///has_trust_boundary.csv' AS row
 MATCH (tb:TrustBoundaryNode {key: row.boundary_key})
 MATCH (c:DFDNode            {key: row.component_key})
 MERGE (tb)-[:PROTECTS]->(c);

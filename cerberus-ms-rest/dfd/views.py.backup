@@ -1,0 +1,900 @@
+import inspect
+from django.http import Http404
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+
+from .models import Project, Diagram, DFDNode, Process, ExternalEntity, DataStore, UserNode
+from .serializers import BulkSyncSerializer, ProjectSerializer, DiagramSerializer, ComponentSerializer, UserSerializer
+from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiTypes, OpenApiExample
+from .serializers import ProjectSerializer, DiagramSerializer, ComponentSerializer, UserSerializer
+from neomodel import DoesNotExist
+from neomodel import db
+from .exceptions import raise_api_error
+
+
+TYPE_TO_NODE = {
+    "process": Process,
+    "external_entity": ExternalEntity,
+    "data_store": DataStore,
+    "container": DFDNode,  # Container uses base DFDNode
+}
+
+def serialize_project(p: Project):
+    # owner (0..1)
+    owner = None
+    owners = p.owner.all()
+    if owners:
+        o = owners[0]
+        owner = {"key": o.key, "email": o.email, "name": o.name, "role": o.role}
+
+    # members (0..N)
+    members = [
+        {"key": m.key, "email": m.email, "name": m.name, "role": m.role}
+        for m in p.members.all()
+    ]
+
+    return {
+        "key": p.key,
+        "name": p.name,
+        "user_id": p.user_id,
+        "meta": p.meta,
+        "owner": owner,
+        "members": members,
+    }
+    
+
+def get_project_or_404(project_id):
+    proj = Project.nodes.first_or_none(key=project_id)
+    if not proj:
+        raise_api_error(f"Project '{project_id}' not found", status.HTTP_404_NOT_FOUND)
+    return proj
+
+def get_diagram_or_404(diagram_id):
+    dia = Diagram.nodes.first_or_none(key=diagram_id)
+    if not dia:
+        raise_api_error(f"Diagram '{diagram_id}' not found", status.HTTP_404_NOT_FOUND)
+    return dia
+
+def ensure_diagram_in_project(proj, dia):
+    if not proj.diagrams.is_connected(dia):
+        raise_api_error(f"Diagram '{dia.key}' not found in project '{proj.key}'", status.HTTP_404_NOT_FOUND)
+
+def type_of_node(node):
+    if isinstance(node, Process):
+        return "process"
+    if isinstance(node, ExternalEntity):
+        return "external_entity"
+    if isinstance(node, DataStore):
+        return "data_store"
+    # Check if it's a container by looking at the UI type
+    if hasattr(node, 'ui') and node.ui and node.ui.get('type') == 'container':
+        return "container"
+    return "unknown"
+
+def serialize_component(node):
+    # Get the UI data, but ensure it includes the node name
+    ui_data = node.ui or {}
+    if "text" not in ui_data or not ui_data["text"]:
+        ui_data["text"] = node.name
+    
+    # Build the complete data object with DFD-specific properties
+    data = {
+        "text": ui_data.get("text", node.name),
+        "color": ui_data.get("color", 4294967295),
+        "borderColor": ui_data.get("borderColor", 4278190080),
+        "borderWidth": ui_data.get("borderWidth", 2),
+        "textAlignment": ui_data.get("textAlignment", "center"),
+        "textSize": ui_data.get("textSize", 20),
+        # DFD-specific properties
+        "uid": node.uid,
+        "key": node.key,
+        "name": node.name,
+        "description": node.description,
+        "dfd_level": node.dfd_level,
+        "zone": node.zone,
+        "owner": node.owner,
+        "criticality": node.criticality,
+    }
+    
+    # Add type-specific properties
+    if isinstance(node, Process):
+        data["tech"] = node.tech
+    elif isinstance(node, ExternalEntity):
+        data["actor_type"] = node.actor_type
+    elif isinstance(node, DataStore):
+        data["store_type"] = node.store_type
+        data["technology"] = node.technology
+        data["retention_days"] = node.retention_days
+        data["encryption_at_rest"] = node.encryption_at_rest
+        data["backups_enabled"] = node.backups_enabled
+        data["rto_hours"] = node.rto_hours
+        data["rpo_hours"] = node.rpo_hours
+    
+    return {
+        "id": node.key,
+        "type": type_of_node(node),
+        "position": {"x": node.pos_x, "y": node.pos_y},
+        "size": {"width": node.width, "height": node.height},
+        "data": data
+    }
+    
+@extend_schema(
+    tags=["Users"],
+    request=UserSerializer,
+    responses={201: UserSerializer, 200: UserSerializer},
+    examples=[
+        OpenApiExample(
+            "Create user",
+            value={"key": "user_bassiman", "email": "bassi@example.com", "name": "Bassiman", "role": "owner"},
+            request_only=True
+        )
+    ]
+)
+class UserListCreateView(APIView):
+    """
+    GET  /api/users/
+    POST /api/users/
+    """
+    def get(self, request):
+        users = UserNode.nodes.all()
+        data = [
+            {"key": u.key, "email": u.email, "name": u.name, "role": u.role, "meta": u.meta}
+            for u in users
+        ]
+        return Response(data)
+
+    def post(self, request):
+        s = UserSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        d = s.validated_data
+
+        user = UserNode.nodes.first_or_none(key=d["key"])
+        if not user:
+            user = UserNode(**d).save()
+        else:
+            user.email = d.get("email", user.email)
+            user.name = d.get("name", user.name)
+            user.role = d.get("role", user.role)
+            user.meta = d.get("meta", user.meta or {})
+            user.save()
+
+        return Response(
+            {"key": user.key, "email": user.email, "name": user.name, "role": user.role, "meta": user.meta},
+            status=status.HTTP_201_CREATED
+        )
+@extend_schema(
+    tags=["Users"],
+    parameters=[OpenApiParameter("user_key", OpenApiTypes.STR, OpenApiParameter.PATH)],
+    responses={200: UserSerializer, 404: None}
+)
+class UserDetailView(APIView):
+    """
+    GET    /api/users/<user_key>/
+    PATCH  /api/users/<user_key>/
+    DELETE /api/users/<user_key>/
+    """
+    def get(self, request, user_key):
+        user = UserNode.nodes.first_or_none(key=user_key)
+        if not user:
+            raise Http404("User not found")
+        return Response({"key": user.key, "email": user.email, "name": user.name, "role": user.role, "meta": user.meta})
+
+    def patch(self, request, user_key):
+        user = UserNode.nodes.first_or_none(key=user_key)
+        if not user:
+            raise Http404("User not found")
+
+        s = UserSerializer(data=request.data, partial=True)
+        s.is_valid(raise_exception=True)
+        d = s.validated_data
+
+        if "email" in d: user.email = d["email"]
+        if "name" in d: user.name = d["name"]
+        if "role" in d: user.role = d["role"]
+        if "meta" in d: user.meta = d["meta"]
+        user.save()
+
+        return Response({"key": user.key, "email": user.email, "name": user.name, "role": user.role, "meta": user.meta})
+
+    def delete(self, request, user_key):
+        user = UserNode.nodes.first_or_none(key=user_key)
+        if not user:
+            raise Http404("User not found")
+
+        # Optional: detach from projects before delete
+        for p in user.owns:         # projects owned by this user
+            p.owner.disconnect(user)
+        for p in user.memberships:  # projects where member
+            p.members.disconnect(user)
+
+        user.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+# ------------------------
+# Projects
+# ------------------------
+
+@extend_schema(
+    tags=["Projects"],
+    request=ProjectSerializer,
+    responses={200: ProjectSerializer, 201: ProjectSerializer}
+)
+class ProjectListCreateView(APIView):
+    def get(self, request):
+        projects = Project.nodes.all()
+        data = [serialize_project(p) for p in projects]
+        return Response(data)
+
+    def post(self, request):
+        s = ProjectSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        d = s.validated_data
+
+        proj = Project.nodes.first_or_none(key=d["key"]) or Project(**d)
+        proj.name = d["name"]
+        proj.user_id = d.get("user_id")
+        proj.meta = d.get("meta", proj.meta or {})
+        proj.save()
+
+        # owner/members (optional) by keys
+        owner_key = d.get("owner_key")
+        if owner_key:
+            user = UserNode.nodes.first_or_none(key=owner_key)
+            if not user:
+                return Response({"error": f"owner_key '{owner_key}' not found"}, status=400)
+            # ensure single owner: disconnect previous owners
+            for prev in proj.owner:
+                proj.owner.disconnect(prev)
+            proj.owner.connect(user)
+
+        member_keys = d.get("member_keys") or []
+        for mk in member_keys:
+            mu = UserNode.nodes.first_or_none(key=mk)
+            if not mu:
+                return Response({"error": f"member_key '{mk}' not found"}, status=400)
+            if not proj.members.is_connected(mu):
+                proj.members.connect(mu)
+
+        return Response(serialize_project(proj), status=status.HTTP_201_CREATED)
+
+@extend_schema(
+    tags=["Projects"],
+    parameters=[OpenApiParameter("project_id", OpenApiTypes.STR, OpenApiParameter.PATH)],
+    responses={200: ProjectSerializer, 404: None}
+)
+class ProjectDetailView(APIView):
+    def get(self, request, project_id):
+        proj = get_project_or_404(project_id)
+        return Response(serialize_project(proj))
+
+    def patch(self, request, project_id):
+        proj = get_project_or_404(project_id)
+        s = ProjectSerializer(data=request.data, partial=True)
+        s.is_valid(raise_exception=True)
+        d = s.validated_data
+
+        if "name" in d: proj.name = d["name"]
+        if "user_id" in d: proj.user_id = d["user_id"]
+        if "meta" in d: proj.meta = d["meta"]
+        proj.save()
+
+        # Optional owner update
+        if "owner_key" in d:
+            # clear if blank
+            if not d["owner_key"]:
+                for prev in proj.owner:
+                    proj.owner.disconnect(prev)
+            else:
+                user = UserNode.nodes.first_or_none(key=d["owner_key"])
+                if not user:
+                    return Response({"error": f"owner_key '{d['owner_key']}' not found"}, status=400)
+                for prev in proj.owner:
+                    proj.owner.disconnect(prev)
+                proj.owner.connect(user)
+
+        # Optional members replace/additive (here: additive)
+        if "member_keys" in d:
+            for mk in d["member_keys"]:
+                mu = UserNode.nodes.first_or_none(key=mk)
+                if not mu:
+                    return Response({"error": f"member_key '{mk}' not found"}, status=400)
+                if not proj.members.is_connected(mu):
+                    proj.members.connect(mu)
+
+        return Response(serialize_project(proj))
+    def delete(self, request, project_id):
+        proj = get_project_or_404(project_id)
+
+        # Delete all diagram subgraph (exclude any UserNode), then delete the project itself.
+        # Uses Neo4j internal id; works across neomodel versions where `proj.id` is available.
+        db.cypher_query("""
+         // 0) Locate the project by elementId (Neo4j 5)
+        MATCH (p:Project)
+        WHERE p.key = $eid
+
+        // 1) Collect this project's diagrams only (directed edge from project)
+        OPTIONAL MATCH (p)-[:HAS_DIAGRAM]->(d:Diagram)
+
+        // 2) From each diagram, walk ONLY diagram-internal edges (directed),
+        //    and explicitly exclude Users and other Projects
+        OPTIONAL MATCH (d)-[:HAS_COMPONENT|HAS_NODE|HAS_EDGE|HAS_LINK*0..6]->(x)
+        WITH p, collect(DISTINCT d) AS ds,
+               [n IN collect(DISTINCT x) WHERE n IS NOT NULL AND NOT n:UserNode AND NOT n:Project] AS internals
+
+        // 3) Delete internals then diagrams, then the project
+        FOREACH (n IN internals | DETACH DELETE n)
+        FOREACH (di IN ds       | DETACH DELETE di)
+
+        // 4) Finally delete the project (detaches any remaining edges, e.g., to users)
+        DETACH DELETE p
+        """,
+        {"eid": proj.key}
+        )
+
+        # 204 No Content
+        return Response(status=204)
+
+# ------------------------
+# Diagrams (scoped to Project)
+# ------------------------
+@extend_schema(
+    tags=["Diagrams"],
+    parameters=[OpenApiParameter("project_id", OpenApiTypes.STR, OpenApiParameter.PATH)],
+    request=DiagramSerializer,
+    responses={200: DiagramSerializer, 201: DiagramSerializer, 404: None}
+)
+class DiagramListCreateView(APIView):
+    """
+    GET  /api/projects/<project_id>/diagrams/
+    POST /api/projects/<project_id>/diagrams/
+    """
+    def get(self, request, project_id):
+        proj = get_project_or_404(project_id)
+        diagrams = proj.diagrams.all()
+        data = [{"key": d.key, "name": d.name, "meta": d.meta} for d in diagrams]
+        return Response({"project": proj.key, "diagrams": data})
+
+    def post(self, request, project_id):
+        proj = get_project_or_404(project_id)
+        s = DiagramSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        d = s.validated_data
+
+        dia = Diagram.nodes.first_or_none(key=d["key"])
+        if not dia:
+            dia = Diagram(**d).save()
+        else:
+            dia.name = d.get("name", dia.name)
+            dia.meta = d.get("meta", dia.meta or {})
+            dia.save()
+
+        if not proj.diagrams.is_connected(dia):
+            proj.diagrams.connect(dia)
+
+        return Response(
+            {"project": proj.key, "diagram": {"key": dia.key, "name": dia.name, "meta": dia.meta}},
+            status=status.HTTP_201_CREATED
+        )
+@extend_schema(
+    tags=["Diagrams"],
+    parameters=[
+        OpenApiParameter("project_id", OpenApiTypes.STR, OpenApiParameter.PATH),
+        OpenApiParameter("diagram_id", OpenApiTypes.STR, OpenApiParameter.PATH),
+    ],
+    responses={200: DiagramSerializer, 404: None}
+)
+class DiagramDetailView(APIView):
+    """
+    GET    /api/projects/<project_id>/diagrams/<diagram_id>/
+    PATCH  /api/projects/<project_id>/diagrams/<diagram_id>/
+    DELETE /api/projects/<project_id>/diagrams/<diagram_id>/
+    """
+    def get(self, request, project_id, diagram_id):
+        proj = get_project_or_404(project_id)
+        dia = get_diagram_or_404(diagram_id)
+        ensure_diagram_in_project(proj, dia)
+        return Response({"project": proj.key, "key": dia.key, "name": dia.name, "meta": dia.meta})
+
+    def patch(self, request, project_id, diagram_id):
+        proj = get_project_or_404(project_id)
+        dia = get_diagram_or_404(diagram_id)
+        ensure_diagram_in_project(proj, dia)
+
+        s = DiagramSerializer(data=request.data, partial=True)
+        s.is_valid(raise_exception=True)
+        d = s.validated_data
+
+        if "name" in d: dia.name = d["name"]
+        if "meta" in d: dia.meta = d["meta"]
+        dia.save()
+
+        return Response({"project": proj.key, "key": dia.key, "name": dia.name, "meta": dia.meta})
+
+    def delete(self, request, project_id, diagram_id):
+        proj = get_project_or_404(project_id)
+        dia = get_diagram_or_404(diagram_id)
+        ensure_diagram_in_project(proj, dia)
+
+        # delete or detach nodes; here we delete nodes fully
+        for node in dia.elements:
+            dia.elements.disconnect(node)
+            node.delete()
+        proj.diagrams.disconnect(dia)
+        dia.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+# ------------------------
+# Components (scoped to Diagram in Project)
+# ------------------------
+
+COMPONENT_CREATE_EXAMPLE = OpenApiExample(
+    "Create component (external entity)",
+    value={
+        "id": "ext_user",
+        "type": "external_entity",
+        "position": {"x": 120, "y": 80},
+        "size": {"width": 120, "height": 72},
+        "data": {
+            "text": "End User",
+            "color": 4294967295,
+            "borderColor": 4278190080,
+            "borderWidth": 2,
+            "textAlignment": "center",
+            "textSize": 20
+        }
+    },
+    request_only=True
+)
+
+@extend_schema(
+    tags=["Components"],
+    parameters=[
+        OpenApiParameter("project_id", OpenApiTypes.STR, OpenApiParameter.PATH),
+        OpenApiParameter("diagram_id", OpenApiTypes.STR, OpenApiParameter.PATH),
+    ],
+    request=ComponentSerializer,
+    responses={200: ComponentSerializer, 201: ComponentSerializer, 404: None},
+    examples=[COMPONENT_CREATE_EXAMPLE]
+)
+class ComponentListCreateUnderDiagramView(APIView):
+    """
+    GET  /api/projects/<project_id>/diagrams/<diagram_id>/components/
+    POST /api/projects/<project_id>/diagrams/<diagram_id>/components/
+    """
+    def get(self, request, project_id, diagram_id):
+        try:
+            proj = get_project_or_404(project_id)
+            dia = get_diagram_or_404(diagram_id)
+            ensure_diagram_in_project(proj, dia)
+
+            nodes = dia.elements.all()
+            results = [serialize_component(n) for n in nodes]
+            return Response({
+                "project": proj.key, 
+                "diagram": dia.key, 
+                "components": results,
+                "success": True
+            })
+        except Exception as e:
+            raise_api_error(f"Error fetching components: {str(e)}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    def post(self, request, project_id, diagram_id):
+        proj = get_project_or_404(project_id)
+        dia = get_diagram_or_404(diagram_id)
+        ensure_diagram_in_project(proj, dia)
+
+        s = ComponentSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        d = s.validated_data
+
+        # Use the improved upsert function
+        node = upsert_component_in_diagram(dia, d)
+
+        return Response(
+            {"project": proj.key, "diagram": dia.key, "component": serialize_component(node)},
+            status=status.HTTP_201_CREATED
+        )
+@extend_schema(
+    tags=["Components"],
+    parameters=[
+        OpenApiParameter("project_id", OpenApiTypes.STR, OpenApiParameter.PATH),
+        OpenApiParameter("diagram_id", OpenApiTypes.STR, OpenApiParameter.PATH),
+        OpenApiParameter("component_id", OpenApiTypes.STR, OpenApiParameter.PATH),
+    ],
+    responses={200: ComponentSerializer, 404: None}
+)
+class ComponentDetailUnderDiagramView(APIView):
+    """
+    GET    /api/projects/<project_id>/diagrams/<diagram_id>/components/<component_id>/
+    PATCH  /api/projects/<project_id>/diagrams/<diagram_id>/components/<component_id>/
+    DELETE /api/projects/<project_id>/diagrams/<diagram_id>/components/<component_id>/
+    """
+    def get(self, request, project_id, diagram_id, component_id):
+        proj = get_project_or_404(project_id)
+        dia = get_diagram_or_404(diagram_id)
+        ensure_diagram_in_project(proj, dia)
+
+        node = DFDNode.nodes.first_or_none(key=component_id)
+        if not node or not dia.elements.is_connected(node):
+            raise Http404("Component not found in diagram")
+
+        return Response(serialize_component(node))
+
+    def patch(self, request, project_id, diagram_id, component_id):
+        proj = get_project_or_404(project_id)
+        dia = get_diagram_or_404(diagram_id)
+        ensure_diagram_in_project(proj, dia)
+
+        node = DFDNode.nodes.first_or_none(key=component_id)
+        if not node or not dia.elements.is_connected(node):
+            raise Http404("Component not found in diagram")
+
+        s = ComponentSerializer(data=request.data, partial=True)
+        s.is_valid(raise_exception=True)
+        d = s.validated_data
+
+        # Add the component ID to the data for upsert function
+        d["id"] = component_id
+        
+        # Use the improved upsert function for consistent handling
+        updated_node = upsert_component_in_diagram(dia, d)
+        
+        return Response(serialize_component(updated_node))
+
+    def delete(self, request, project_id, diagram_id, component_id):
+        proj = get_project_or_404(project_id)
+        dia = get_diagram_or_404(diagram_id)
+        ensure_diagram_in_project(proj, dia)
+
+        node = DFDNode.nodes.first_or_none(key=component_id)
+        if not node or not dia.elements.is_connected(node):
+            raise Http404("Component not found in diagram")
+
+        dia.elements.disconnect(node)
+        node.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+    
+def upsert_component_in_diagram(dia, c: dict):
+    """
+    Ensures a DFDNode exists/updated for payload 'c' and is attached to diagram 'dia'.
+    Returns the DFDNode instance.
+    Expected 'c' has at least: {"id": "...", "type": "..."} plus optional props.
+    """
+    if inspect.isclass(dia):
+        raise AssertionError("Expected Diagram instance, got class")
+
+    # ---- RelationshipManager (NOT class-level NodeSet)
+    rel = dia.elements
+    if not hasattr(rel, "is_connected"):
+        raise AssertionError("dia.elements is not a RelationshipManager. Check your Diagram model.")
+
+    # ---- Extract data from payload
+    key = c["id"]
+    component_type = c.get("type", "process")
+    position = c.get("position", {})
+    size = c.get("size", {})
+    data = c.get("data", {})
+    
+    # ---- Determine the correct node class
+    node_cls = TYPE_TO_NODE.get(component_type, Process)
+    
+    # ---- Upsert node by key
+    node = node_cls.nodes.first_or_none(key=key)
+    if node is None:
+        # Create new node with all DFD properties
+        node_data = {
+            "key": key,
+            "name": data.get("name") or data.get("text") or "",
+            "description": data.get("description"),
+            "dfd_level": data.get("dfd_level", 0),
+            "zone": data.get("zone"),
+            "owner": data.get("owner"),
+            "criticality": data.get("criticality", "medium"),
+            "pos_x": position.get("x", 0.0),
+            "pos_y": position.get("y", 0.0),
+            "width": size.get("width", 120.0),
+            "height": size.get("height", 72.0),
+            "ui": data,  # Store the complete data object in UI
+        }
+        
+        # Add type-specific properties
+        if component_type == "process":
+            node_data["tech"] = data.get("tech")
+        elif component_type == "external_entity":
+            node_data["actor_type"] = data.get("actor_type", "user")
+        elif component_type == "data_store":
+            node_data["store_type"] = data.get("store_type", "database")
+            node_data["technology"] = data.get("technology")
+            node_data["retention_days"] = data.get("retention_days", 0)
+            node_data["encryption_at_rest"] = data.get("encryption_at_rest", True)
+            node_data["backups_enabled"] = data.get("backups_enabled", True)
+            node_data["rto_hours"] = data.get("rto_hours", 4.0)
+            node_data["rpo_hours"] = data.get("rpo_hours", 1.0)
+        
+        node = node_cls(**node_data).save()
+    else:
+        # Update existing node
+        dirty = False
+        
+        # Update basic DFD properties
+        if "name" in data and node.name != data["name"]:
+            node.name = data["name"]
+            dirty = True
+        if "description" in data and node.description != data["description"]:
+            node.description = data["description"]
+            dirty = True
+        if "dfd_level" in data and node.dfd_level != data["dfd_level"]:
+            node.dfd_level = data["dfd_level"]
+            dirty = True
+        if "zone" in data and node.zone != data["zone"]:
+            node.zone = data["zone"]
+            dirty = True
+        if "owner" in data and node.owner != data["owner"]:
+            node.owner = data["owner"]
+            dirty = True
+        if "criticality" in data and node.criticality != data["criticality"]:
+            node.criticality = data["criticality"]
+            dirty = True
+            
+        # Update position and size
+        if "x" in position and node.pos_x != position["x"]:
+            node.pos_x = position["x"]
+            dirty = True
+        if "y" in position and node.pos_y != position["y"]:
+            node.pos_y = position["y"]
+            dirty = True
+        if "width" in size and node.width != size["width"]:
+            node.width = size["width"]
+            dirty = True
+        if "height" in size and node.height != size["height"]:
+            node.height = size["height"]
+            dirty = True
+            
+        # Update UI data
+        if data and node.ui != data:
+            node.ui = data
+            dirty = True
+            
+        # Update type-specific properties
+        if isinstance(node, Process) and "tech" in data and node.tech != data["tech"]:
+            node.tech = data["tech"]
+            dirty = True
+        elif isinstance(node, ExternalEntity) and "actor_type" in data and node.actor_type != data["actor_type"]:
+            node.actor_type = data["actor_type"]
+            dirty = True
+        elif isinstance(node, DataStore):
+            if "store_type" in data and node.store_type != data["store_type"]:
+                node.store_type = data["store_type"]
+                dirty = True
+            if "technology" in data and node.technology != data["technology"]:
+                node.technology = data["technology"]
+                dirty = True
+            if "retention_days" in data and node.retention_days != data["retention_days"]:
+                node.retention_days = data["retention_days"]
+                dirty = True
+            if "encryption_at_rest" in data and node.encryption_at_rest != data["encryption_at_rest"]:
+                node.encryption_at_rest = data["encryption_at_rest"]
+                dirty = True
+            if "backups_enabled" in data and node.backups_enabled != data["backups_enabled"]:
+                node.backups_enabled = data["backups_enabled"]
+                dirty = True
+            if "rto_hours" in data and node.rto_hours != data["rto_hours"]:
+                node.rto_hours = data["rto_hours"]
+                dirty = True
+            if "rpo_hours" in data and node.rpo_hours != data["rpo_hours"]:
+                node.rpo_hours = data["rpo_hours"]
+                dirty = True
+        
+        if dirty:
+            node.save()
+
+    # ---- Ensure membership of this diagram via REL
+    if not rel.is_connected(node):
+        rel.connect(node)
+
+    return node
+
+def get_rel_props_from_conn(conn: dict):
+    # Your payload has: {"data":{"startLabel":"","endLabel":"","data":""}}
+    data = conn.get("data", {}) or {}
+    start_label = data.get("startLabel", "")
+    end_label   = data.get("endLabel", "")
+    ui_blob     = data.get("data", "")  # keep raw; or coerce to dict if you prefer
+    ui = {"raw": ui_blob} if not isinstance(ui_blob, dict) else ui_blob
+    return start_label, end_label, ui
+
+def upsert_connection(source_node: 'DFDNode', target_node: 'DFDNode', conn: dict):
+    link_id = conn["id"]
+    start_label, end_label, ui = get_rel_props_from_conn(conn)
+
+    # Try to find existing relationship with same key between these two nodes.
+    existing = None
+    for tgt in source_node.flows_to:  # iterate outgoings
+        if tgt.key == target_node.key:
+            rel = source_node.flows_to.relationship(tgt)
+            # If you allow multiple parallels, inspect rel.key; else treat as unique
+            if hasattr(rel, "key") and rel.key == link_id:
+                existing = rel
+                break
+            # If only one rel allowed per (src,tgt), treat it as existing
+            if existing is None:
+                existing = rel
+
+    if existing:
+        if hasattr(existing, "key"): existing.key = link_id
+        if hasattr(existing, "start_label"): existing.start_label = start_label
+        if hasattr(existing, "end_label"):   existing.end_label   = end_label
+        if hasattr(existing, "ui"):          existing.ui = {**(existing.ui or {}), **ui}
+        existing.save()
+        return "updated"
+    else:
+        # Create new
+        source_node.flows_to.connect(target_node, {
+            "key": link_id,
+            "start_label": start_label,
+            "end_label": end_label,
+            "ui": ui
+        })
+        return "created"
+    
+
+
+
+def get_diagram_or_404(diagram_id):
+    try:
+        return Diagram.nodes.get(key=diagram_id)  # returns an INSTANCE
+    except DoesNotExist:
+        raise Http404(f"Diagram {diagram_id} not found")
+    
+class DiagramBulkSyncView(APIView):
+    """
+    POST projects/<project_id>/diagrams/<diagram_id>/sync
+    Body: {components:[...], connections:[...], options:{prune_components?, prune_connections?}}
+    """
+    
+    @extend_schema(
+        tags=["Diagrams"],
+        parameters=[
+            OpenApiParameter("project_id", OpenApiTypes.STR, OpenApiParameter.PATH),
+            OpenApiParameter("diagram_id", OpenApiTypes.STR, OpenApiParameter.PATH),
+        ],
+        request=BulkSyncSerializer,
+        responses={200: None, 201: None, 404: None},
+        examples=[
+            OpenApiExample(
+                "Bulk sync with your schema",
+                value={
+                    "components":[
+                        {
+                            "id":"ac930fa4-df3e-4923-8636-9e2e1895657f",
+                            "position":{"x":133.85621643066406,"y":378.9837646484375},
+                            "size":{"width":72,"height":72},
+                            "type":"process",
+                            "data":{"shape":"process","color":"4294967295","borderColor":"4284513675",
+                                    "borderWidth":4,"text":"https://cdn.simpleicons.org/openjdk/000000",
+                                    "textAlignment":"center","textSize":16}
+                        },
+                        {
+                            "id":"136ee2d7-dad0-41d4-af72-3ed56eacd4dd",
+                            "position":{"x":287.07177734375,"y":387.1061096191406},
+                            "size":{"width":72,"height":72},
+                            "type":"process",
+                            "data":{"shape":"process","color":"4294967295","borderColor":"4284513675",
+                                    "borderWidth":4,"text":"https://cdn.simpleicons.org/ruby/CC342D",
+                                    "textAlignment":"center","textSize":16}
+                        }
+                    ],
+                    "connections":[
+                        {
+                            "id":"62b34a8c-2f07-45a5-930a-fae2bf257efd",
+                            "from":"ac930fa4-df3e-4923-8636-9e2e1895657f",
+                            "to":"136ee2d7-dad0-41d4-af72-3ed56eacd4dd",
+                            "data":{"startLabel":"","endLabel":"","data":""}
+                        }
+                    ],
+                    "options":{"prune_components": False, "prune_connections": False}
+                },
+                request_only=True
+            )
+        ]
+    )
+    def post(self, request, project_id, diagram_id):
+        proj = get_project_or_404(project_id)
+        dia  = get_diagram_or_404(diagram_id)
+        ensure_diagram_in_project(proj, dia)
+
+        # ---- SAFETY: ensure 'dia' is an instance
+        if inspect.isclass(dia):
+            raise_api_error("Expected Diagram instance, got class (check get_diagram_or_404)", status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        # ---- RelationshipManager for nodes in this diagram
+        rel = dia.elements  # <-- renamed relationship
+        if not hasattr(rel, "is_connected"):
+            raise_api_error(
+                "dia.elements is not a RelationshipManager. "
+                "Likely using class-level NodeSet; ensure 'dia' is an instance and 'elements' is a RelationshipTo.",
+                status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+        s = BulkSyncSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        payload = s.validated_data
+
+        comps = payload.get("components", [])
+        conns = payload.get("connections", [])
+        opts  = payload.get("options", {})
+        prune_components  = bool(opts.get("prune_components", False))
+        prune_connections = bool(opts.get("prune_connections", False))
+
+        # ---- Upsert components
+        upserted_nodes = {}
+        component_errors = []
+        for c in comps:
+            try:
+                node = upsert_component_in_diagram(dia, c)   # ensure this uses dia.elements inside
+                upserted_nodes[node.key] = node
+            except Exception as e:
+                component_errors.append({
+                    "id": c.get("id", "unknown"),
+                    "error": f"Failed to upsert component: {str(e)}"
+                })
+
+        # ---- Optional prune components not present in payload
+        pruned_component_ids = []
+        if prune_components:
+            keep_ids = {c["id"] for c in comps}
+            for node in rel.all():  # dia.elements.all()
+                if node.key not in keep_ids:
+                    rel.disconnect(node)  # detach from diagram
+                    node.delete()
+                    pruned_component_ids.append(node.key)
+
+        # ---- Upsert connections
+        conn_results = []
+        errors = []
+        for conn in conns:
+            src_id = conn["from"]
+            dst_id = conn["to"]
+
+            # ensure nodes exist (from current payload upserts or DB)
+            src = upserted_nodes.get(src_id) or DFDNode.nodes.first_or_none(key=src_id)
+            dst = upserted_nodes.get(dst_id) or DFDNode.nodes.first_or_none(key=dst_id)
+            if not src or not dst:
+                errors.append({"id": conn.get("id"), "error": f"missing node(s): from={src_id}, to={dst_id}"})
+                continue
+
+            # ensure endpoints are attached to this diagram
+            if not rel.is_connected(src): rel.connect(src)
+            if not rel.is_connected(dst): rel.connect(dst)
+
+            status_str = upsert_connection(src, dst, conn)  # make sure this sets/updates rel key etc.
+            conn_results.append({"id": conn.get("id"), "status": status_str})
+
+        # ---- Optional prune connections not present in payload
+        pruned_connection_ids = []
+        if prune_connections:
+            keep_ids = {c["id"] for c in conns}
+            # scope by endpoints that belong to this diagram
+            for src in rel.all():  # nodes in this diagram
+                for tgt in src.flows_to.all():  # use .all() to be explicit
+                    r = src.flows_to.relationship(tgt)
+                    rkey = getattr(r, "key", None)
+                    if rkey and rkey not in keep_ids:
+                        src.flows_to.disconnect(tgt)
+                        pruned_connection_ids.append(rkey)
+
+        # Combine all errors
+        all_errors = errors + component_errors
+        
+        return Response({
+            "project": proj.key,
+            "diagram": dia.key,
+            "upserted_components": list(upserted_nodes.keys()),
+            "connections": conn_results,
+            "pruned_components": pruned_component_ids,
+            "pruned_connections": pruned_connection_ids,
+            "errors": all_errors,
+            "success": len(all_errors) == 0
+        }, status=status.HTTP_200_OK)
+        

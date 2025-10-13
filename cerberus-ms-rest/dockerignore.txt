@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Envs
+env/
+venv/
+.venv/
+
+# OS/IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Local data
+db.sqlite3
+neo4j_data/
+neo4j_logs/
+neo4j_import/
+
+# Git
+.git
+.gitignore

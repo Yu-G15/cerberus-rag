@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+httpx
+python-dotenv
+pydantic>=2
+fastapi>=0.110
+uvicorn[standard]>=0.27
+httpx>=0.27
+pydantic>=2.6
